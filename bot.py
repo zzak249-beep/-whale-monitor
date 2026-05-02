@@ -1,37 +1,49 @@
 # -*- coding: utf-8 -*-
-"""bot.py -- Three Step Future-Trend Bot  v1.0
-Reads Three Step volume delta signals (BigBeluga / Pine Script port),
-manages breakeven + partial TP + delta-trail exit.
-Deploys on Railway via Procfile.
-"""
+"""bot.py -- Phantom Edge Bot: ZigZag(5m) + Supertrend(15m) -- Todos los pares BingX."""
 from __future__ import annotations
 import asyncio
-import os
+import signal
 import sys
-from datetime import datetime
+from collections import Counter
 
 from loguru import logger
 from aiohttp import web
 
-from core.config import cfg
-from exchange import client as ex
-from scanner import fetch_universe
+from config import cfg
+import client as ex
+from scanner import fetch_universe, get_symbols
 from strategy import get_signal
 from pos_manager import (
-    Trade, add_trade, open_symbols, trade_count,
-    manage_positions, sync_from_exchange,
+    Trade, add_trade, open_symbols, trade_count, is_halted,
+    manage_positions, sync_from_exchange, get_stats, consecutive_losses,
 )
-from notifier import notify
+import notifier
 
-# ── Logging setup ─────────────────────────────────────────────────────────────
 logger.remove()
-logger.add(sys.stdout, level="INFO",
-           format="<green>{time:HH:mm:ss}</green> | <level>{level: <7}</level> | {message}")
+logger.add(
+    sys.stdout, level="INFO",
+    format="<green>{time:HH:mm:ss}</green> | <level>{level: <7}</level> | {message}"
+)
+
+_active_symbols: list[str] = []
+_cycle: int = 0
+SYMBOL_REFRESH_CYCLES = 60
 
 
-# ── Health-check server (required by Railway) ─────────────────────────────────
 async def _health(_: web.Request) -> web.Response:
-    return web.json_response({"status": "ok", "trades": trade_count()})
+    stats = get_stats()
+    return web.json_response({
+        "status":        "halted" if stats["halted"] else "ok",
+        "version":       "phantom-zigzag-1.0",
+        "open_trades":   stats["open"],
+        "daily_trades":  stats["daily_trades"],
+        "daily_pnl":     stats["daily_pnl"],
+        "daily_wins":    stats["daily_wins"],
+        "daily_losses":  stats["daily_losses"],
+        "consec_losses": stats["consec_losses"],
+        "total_symbols": len(_active_symbols),
+        "symbols_open":  list(open_symbols()),
+    })
 
 
 async def start_health_server() -> None:
@@ -42,141 +54,207 @@ async def start_health_server() -> None:
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", cfg.health_port)
     await site.start()
-    logger.info(f"Health server listening on :{cfg.health_port}")
+    logger.info(f"Health :{cfg.health_port}")
 
 
-# ── Entry execution ───────────────────────────────────────────────────────────
-async def enter_trade(sig, ohlcv: dict) -> None:
-    """Set leverage, place order, record trade."""
-    from core.config import cfg
+async def enter_trade(sig) -> None:
+    if sig.symbol in open_symbols(): return
+    if trade_count() >= cfg.max_positions: return
+    if is_halted(): return
 
-    # Guard: already in this symbol
-    if sig.symbol in open_symbols():
+    # Score minimo sube si hay perdidas consecutivas
+    min_s = cfg.min_score + 2 if consecutive_losses() >= 3 else cfg.min_score
+    if sig.score < min_s:
+        logger.debug(f"[SKIP] {sig.symbol} score={sig.score}<{min_s}")
         return
 
-    # Guard: max positions
-    if trade_count() >= cfg.max_positions:
-        logger.debug(f"[SKIP] max positions reached ({cfg.max_positions})")
-        return
+    size   = max(cfg.trade_usdt, 5.0)
+    lev    = cfg.leverage
+    margin = (size / lev) * 1.3
 
-    # Balance check
     bal = await ex.get_balance()
-    if bal < cfg.trade_usdt * 1.1:
-        logger.warning(f"[SKIP] balance too low: {bal:.2f} USDT")
-        await notify(f"[WARN] Balance too low: {bal:.2f} USDT. Skipping {sig.symbol}.")
+    if bal < cfg.min_balance_usdt or bal < margin:
+        logger.warning(f"[SKIP] {sig.symbol} balance {bal:.2f} insuficiente")
         return
 
-    # Set leverage
-    await ex.set_leverage(sig.symbol, cfg.leverage)
+    if sig.side == "BUY"  and (sig.sl >= sig.price or sig.tp <= sig.price): return
+    if sig.side == "SELL" and (sig.sl <= sig.price or sig.tp >= sig.price): return
+    if abs(sig.price - sig.sl) / sig.price * 100 < 0.08: return
+
+    await ex.set_leverage(sig.symbol, lev)
     await asyncio.sleep(0.2)
 
-    # Place order
     resp = await ex.place_market_order(
         symbol=sig.symbol, side=sig.side,
-        size_usdt=cfg.trade_usdt,
-        sl=sig.sl, tp=sig.tp,
+        size_usdt=size, sl=sig.sl, tp=sig.tp,
     )
     code = resp.get("code", -1)
     if code not in (0, 200, None):
-        logger.warning(f"[ORDER FAIL] {sig.symbol} code={code} {resp.get('msg','')}")
+        logger.warning(f"[FAIL] {sig.symbol} code={code} {resp.get('msg','')}")
         return
 
-    # Estimate qty from filled data
-    order_data = resp.get("data", {}).get("order", {})
-    qty = float(order_data.get("executedQty", 0) or order_data.get("origQty", 0))
-    if qty <= 0:
-        # Fallback estimate
-        qty = (cfg.trade_usdt * cfg.leverage) / sig.price
+    od  = resp.get("data", {})
+    if isinstance(od, dict): od = od.get("order", od)
+    qty = float(od.get("executedQty", 0) or od.get("origQty", 0))
+    if qty <= 0: qty = (size * lev) / sig.price
 
-    trade = Trade(
+    add_trade(Trade(
         symbol=sig.symbol, side=sig.side,
         entry=sig.price, sl=sig.sl, tp=sig.tp,
-        atr=sig.atr, size_usdt=cfg.trade_usdt, qty=qty,
-        order_id=str(order_data.get("orderId", "")),
-    )
-    add_trade(trade)
+        atr=sig.atr_5m, size_usdt=size, leverage=lev,
+        qty=qty, score=sig.score, vol_ratio=sig.vol_ratio,
+        delta1=sig.zz_high, delta2=sig.zz_low,
+        order_id=str(od.get("orderId", "")),
+        bot_opened=True,
+    ))
 
     logger.success(
-        f"[ENTRY] {sig.symbol} {sig.side} @ {sig.price:.6f} "
-        f"SL={sig.sl:.6f} TP={sig.tp:.6f} qty={qty:.6f}"
+        f"[ENTRADA] {sig.symbol} {sig.side} @ {sig.price:.6f} | "
+        f"SL={sig.sl:.6f} TP={sig.tp:.6f} | "
+        f"ZZ_H={sig.zz_high:.4f} ZZ_L={sig.zz_low:.4f} | "
+        f"trend={sig.zz_trend} ST={'BULL' if sig.st_bull_15m else 'BEAR'} | "
+        f"score={sig.score}/10 vol={sig.vol_ratio:.1f}x"
     )
-    await notify(
-        f"*[ENTRY]* {sig.symbol} `{sig.side}`\n"
-        f"Pattern: `{sig.pattern}`\n"
-        f"Price: `{sig.price:.6f}`\n"
-        f"SL: `{sig.sl:.6f}`\n"
-        f"TP: `{sig.tp:.6f}`\n"
-        f"Size: {cfg.trade_usdt} USDT x{cfg.leverage}\n"
-        f"Delta1: {sig.delta1:+.0f}  Delta2: {sig.delta2:+.0f}"
+    await notifier.notify_entry(
+        symbol=sig.symbol, side=sig.side, price=sig.price,
+        sl=sig.sl, tp=sig.tp, size_usdt=size, leverage=lev,
+        qty=qty, score=sig.score,
+        delta1=sig.zz_high, delta2=sig.zz_low, vol_ratio=sig.vol_ratio,
     )
 
 
-# ── Main scan loop ────────────────────────────────────────────────────────────
-async def scan_cycle() -> None:
-    symbols = cfg.symbols
-    logger.info(f"Scanning {len(symbols)} symbols on {cfg.timeframe} | "
-                f"period={cfg.period} atr_mult={cfg.atr_mult} rr={cfg.rr}")
+async def scan_cycle(ohlcv_map: dict) -> None:
+    signals:    list = []
+    rejections: Counter = Counter()
 
-    ohlcv_map = await fetch_universe(symbols, cfg.timeframe, cfg.max_concurrent)
+    for sym, data in ohlcv_map.items():
+        if sym in open_symbols(): continue
 
-    # ── Manage open positions first ──
-    await manage_positions(ohlcv_map)
-
-    # ── Look for new signals ──
-    for sym, ohlcv in ohlcv_map.items():
-        if sym in open_symbols():
-            continue
-        sig = get_signal(
-            ohlcv, sym,
-            period=cfg.period,
-            atr_period=cfg.atr_period,
-            atr_mult=cfg.atr_mult,
-            rr=cfg.rr,
-            dt_lookback=cfg.dt_lookback,
-            dt_tolerance=cfg.dt_tolerance,
-            dt_pivot_win=cfg.dt_pivot_win,
-            require_pattern=cfg.require_pattern,
+        sig, reason = get_signal(
+            ohlcv_5m    = data.get(cfg.timeframe,      {}),
+            ohlcv_15m   = data.get(cfg.timeframe_slow, None),
+            ohlcv_1h    = data.get(cfg.timeframe_1h,   None),
+            symbol      = sym,
+            atr_period  = cfg.atr_period,
+            atr_mult    = cfg.atr_mult,
+            rr          = cfg.rr,
+            min_vol_mult= cfg.min_vol_mult,
+            st_period   = cfg.st_period,
+            st_mult     = cfg.st_mult,
+            rsi_period  = cfg.rsi_period,
+            min_atr_pct = cfg.min_atr_pct,
+            min_score   = cfg.min_score,
+            zz_deviation= cfg.zz_deviation,
         )
         if sig:
-            logger.info(f"[SIGNAL] {sym} {sig.side} | {sig.pattern} | D1={sig.delta1:+.0f} D2={sig.delta2:+.0f}")
-            await enter_trade(sig, ohlcv)
+            signals.append(sig)
+        else:
+            bucket = reason.split("_")[0].split("=")[0].split(" ")[0]
+            rejections[bucket] += 1
+
+    logger.info(
+        f"[ANALISIS] {len(ohlcv_map)-len(open_symbols())} pares | "
+        f"{len(signals)} senales ZigZag | "
+        f"rechazos: {dict(rejections.most_common(5))}"
+    )
+
+    if not signals: return
+
+    signals.sort(key=lambda s: s.score, reverse=True)
+    logger.info(f"[TOP SENALES]")
+    for s in signals[:8]:
+        logger.info(
+            f"  {s.symbol:16s} {s.side:4s} score={s.score:2d}/10 "
+            f"trend={s.zz_trend:4s} ST={'B' if s.st_bull_15m else 'S'} "
+            f"vol={s.vol_ratio:.1f}x ZH={s.zz_high:.4f} ZL={s.zz_low:.4f}"
+        )
+
+    for sig in signals:
+        if trade_count() >= cfg.max_positions: break
+        await enter_trade(sig)
 
 
 async def main_loop() -> None:
+    global _active_symbols, _cycle
+
     await start_health_server()
+    _active_symbols = await get_symbols(cfg.symbols_raw)
 
-    logger.info("=" * 60)
-    logger.info("  THREE STEP FUTURE-TREND BOT  v1.0")
-    logger.info(f"  Symbols : {cfg.symbols}")
-    logger.info(f"  TF      : {cfg.timeframe}")
-    logger.info(f"  Trade   : {cfg.trade_usdt} USDT x{cfg.leverage}")
-    logger.info(f"  Period  : {cfg.period}  ATR mult={cfg.atr_mult}  RR={cfg.rr}")
-    logger.info("=" * 60)
+    logger.info("=" * 68)
+    logger.info("  PHANTOM EDGE BOT -- ZigZag + Supertrend -- ALL SYMBOLS")
+    logger.info(f"  ZZ desviacion={cfg.zz_deviation}% | ST({cfg.st_period},{cfg.st_mult})")
+    logger.info(f"  ATR x{cfg.atr_mult} | RR 1:{cfg.rr} | MinScore={cfg.min_score}/10")
+    logger.info(f"  {max(cfg.trade_usdt,5)} USDT x{cfg.leverage} | MaxPos={cfg.max_positions}")
+    logger.info(f"  Simbolos: {len(_active_symbols)}")
+    logger.info("=" * 68)
 
-    await notify(
-        "*Three Step Future-Trend Bot Started* [v1.0]\n"
-        f"Symbols: {', '.join(cfg.symbols)}\n"
-        f"TF: {cfg.timeframe} | Trade: {cfg.trade_usdt} USDT x{cfg.leverage}\n"
-        f"Period: {cfg.period} | ATR: {cfg.atr_mult}x | RR: {cfg.rr}"
+    bal = await ex.get_balance()
+    logger.info(f"  Balance: {bal:.2f} USDT")
+
+    await notifier.test_telegram()
+    await notifier.notify(
+        f"Phantom Edge Bot iniciado\n"
+        f"Estrategia: ZigZag({cfg.zz_deviation}%) + Supertrend(15m) + RSI\n"
+        f"SL en estructura de swings reales\n"
+        f"RR 1:{cfg.rr} | x{cfg.leverage} | Score min {cfg.min_score}/10\n"
+        f"Pares: {len(_active_symbols)} | Balance: {bal:.2f} USDT"
     )
 
-    # Re-import surviving positions from exchange
     await sync_from_exchange()
 
-    while True:
+    loop = asyncio.get_event_loop()
+    stop_event = asyncio.Event()
+    for s in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(s, lambda: stop_event.set())
+
+    while not stop_event.is_set():
         try:
-            t0 = asyncio.get_event_loop().time()
-            await scan_cycle()
-            elapsed = asyncio.get_event_loop().time() - t0
-            sleep_for = max(0, cfg.scan_interval - elapsed)
-            logger.info(f"Cycle done in {elapsed:.1f}s | sleeping {sleep_for:.0f}s")
-            await asyncio.sleep(sleep_for)
+            if is_halted():
+                await asyncio.sleep(60)
+                continue
+
+            if _cycle > 0 and _cycle % SYMBOL_REFRESH_CYCLES == 0:
+                _active_symbols = await get_symbols(cfg.symbols_raw)
+                logger.info(f"[SYMBOLS] Actualizado: {len(_active_symbols)} pares")
+
+            _cycle += 1
+            t0 = loop.time()
+
+            logger.info(
+                f"CICLO {_cycle:04d} | {len(_active_symbols)} pares | "
+                f"open={trade_count()}/{cfg.max_positions} | "
+                f"consec_loss={consecutive_losses()}"
+            )
+
+            ohlcv_map = await fetch_universe(
+                _active_symbols,
+                tf_5m  = cfg.timeframe,
+                tf_15m = cfg.timeframe_slow,
+                tf_1h  = cfg.timeframe_1h,
+                max_concurrent = cfg.max_concurrent,
+            )
+
+            await manage_positions(ohlcv_map)
+            await scan_cycle(ohlcv_map)
+
+            elapsed   = loop.time() - t0
+            sleep_for = max(0.0, cfg.scan_interval - elapsed)
+            logger.info(f"Ciclo {elapsed:.1f}s | siguiente en {sleep_for:.0f}s")
+
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=sleep_for)
+            except asyncio.TimeoutError:
+                pass
+
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.error(f"[LOOP ERROR] {e}")
-            await notify(f"[BOT ERROR] {e}")
+            logger.error(f"[ERROR] {e}")
+            await notifier.notify(f"Error: {e}")
             await asyncio.sleep(30)
+
+    logger.info("Bot detenido")
+    await ex.close_session()
 
 
 if __name__ == "__main__":
