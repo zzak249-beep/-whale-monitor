@@ -1,300 +1,273 @@
 """
-main.py — Cerebro del Sniper Bot V36 Quantum Edge.
-
-Dos modos (BOT_MODE):
-  MULTI  → Escanea TODOS los futuros de BingX cada ciclo,
-            detecta señales, ejecuta las mejores oportunidades
-            hasta MAX_OPEN_TRADES posiciones simultáneas.
-  SINGLE → Opera solo el par definido en SYMBOL (comportamiento clásico).
+main.py — Sniper Bot V35: Golden Equilibrium
+FIX: Diagnóstico completo por símbolo en cada tick
+FIX: Logs de razón de rechazo por filtro
 """
+import logging
+import os
+import sys
 import time
+from collections import Counter
+from datetime import datetime, timezone
+
 import schedule
-import pandas as pd
-from datetime import datetime
 
-import config
-from indicators import apply_quantum_edge
-from bingx import get_klines, place_order, close_position, set_leverage
-from scanner import run_full_scan
-from telegram_notifier import (
-    notify_startup, notify_shutdown, notify_error,
-    notify_scan_summary, notify_top_opportunities, notify_signals_found,
-    notify_signal_long, notify_signal_short,
-    notify_order_filled, notify_order_error,
-    notify_close_timestop, notify_heartbeat,
+from bingx_client import BingXClient
+from config import (
+    BINGX_MODE, CANDLE_INTERVAL, DATA_DIR, DRY_RUN,
+    LEVERAGE, MAX_OPEN_TRADES, TIME_STOP_CANDLES, TOP_N_SYMBOLS,
+    VOL_MULT, ADX_MIN,
 )
+from learning_engine import LearningEngine
+from risk_manager import RiskManager
+from hourly_reviewer import HourlyReviewer
+from scanner import MarketScanner
+from strategy import StrategyV35
+from telegram_notifier import TelegramNotifier
 
-# ─── Estado global ───────────────────────────────────────────
-# open_positions: dict keyed by symbol
-# {
-#   "BTC-USDT": {direction, entry_price, sl_price, tp_price, qty, bars_in_trade}
-# }
-open_positions: dict = {}
+# ─── Logging ──────────────────────────────────────────────
+os.makedirs(DATA_DIR, exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(f"{DATA_DIR}/bot.log"),
+    ],
+)
+logger = logging.getLogger("SniperV35")
 
-stats = {
-    "total_scans":   0,
-    "total_signals": 0,
-    "heartbeat_ctr": 0,
-}
 
+class SniperBotV35:
+    def __init__(self):
+        logger.info("Inicializando Sniper Bot V35: Golden Equilibrium...")
+        self.client   = BingXClient()
+        self.strategy = StrategyV35()
+        self.telegram = TelegramNotifier()
+        self.scanner  = MarketScanner(self.client)
+        self.risk     = RiskManager()
+        self.learning = LearningEngine(telegram=self.telegram)
+        self.reviewer = HourlyReviewer(self.learning, self.telegram, self.client)
+        self._active: dict  = {}
+        self._top_symbols: list = []
+        self._tick_count: int   = 0
 
-# ─────────────────────────────────────────────────────────────
-#  MODO MULTI — escaneo de todos los pares
-# ─────────────────────────────────────────────────────────────
-
-def cycle_multi():
-    """Ciclo completo en modo MULTI-MONEDA."""
-    global open_positions
-    now = datetime.now().strftime("%H:%M:%S")
-    stats["total_scans"] += 1
-    stats["heartbeat_ctr"] += 1
-
-    # ── Gestionar posiciones abiertas ────────────────────────
-    to_close = []
-    for sym, pos in open_positions.items():
-        pos["bars_in_trade"] += 1
-        print(f"[{now}] 📂 {sym} {pos['direction']} — vela {pos['bars_in_trade']}/{config.TIME_STOP}")
-        if pos["bars_in_trade"] >= config.TIME_STOP:
-            to_close.append(sym)
-
-    for sym in to_close:
-        pos = open_positions[sym]
-        print(f"[{now}] ⏳ TIME STOP {sym}")
-        notify_close_timestop(sym, pos["direction"], pos["bars_in_trade"])
-        if not config.DRY_RUN:
-            close_side = "SELL" if pos["direction"] == "LONG" else "BUY"
-            try:
-                close_position(sym, close_side, pos["qty"])
-            except Exception as ex:
-                notify_error(f"Error cerrando {sym}: {ex}")
-        del open_positions[sym]
-
-    # ── Comprobar si hay hueco para nuevas posiciones ────────
-    slots_free = config.MAX_OPEN_TRADES - len(open_positions)
-    if slots_free <= 0:
-        print(f"[{now}] 🔒 Máximo de posiciones alcanzado ({config.MAX_OPEN_TRADES}). Esperando...")
-        return
-
-    # ── Escaneo completo ─────────────────────────────────────
-    t0 = time.time()
-    try:
-        scan = run_full_scan(
-            timeframe=config.TIMEFRAME,
-            min_volume=config.MIN_VOLUME_24H,
-            top_n=config.TOP_N_RESULTS,
-            delay_ms=config.SCAN_DELAY_MS,
+    # ─── Startup ──────────────────────────────────────────
+    def startup(self):
+        balance = self.client.get_balance()
+        self._top_symbols = self.scanner.get_top_symbols(TOP_N_SYMBOLS)
+        logger.info(
+            f"Balance=${balance:.2f} USDT | Pares={len(self._top_symbols)} | "
+            f"DRY_RUN={DRY_RUN} | MODE={BINGX_MODE.upper()} | "
+            f"VOL≥{VOL_MULT}x | ADX≥{ADX_MIN}"
         )
-    except Exception as e:
-        notify_error(f"Error en escaneo: {e}")
-        return
+        self.telegram.notify_startup(balance, len(self._top_symbols), dry_run=DRY_RUN)
+        self.telegram.notify_scan_results(self._top_symbols, self.scanner)
 
-    duration = time.time() - t0
-
-    # ── Notificar resumen ────────────────────────────────────
-    notify_scan_summary(scan["total"], scan["longs"], scan["shorts"], duration)
-    notify_top_opportunities(scan["top"], top_n=config.TOP_N_RESULTS)
-
-    # ── Filtrar señales que ya están en posición ─────────────
-    new_signals = [
-        r for r in scan["signals"]
-        if r["symbol"] not in open_positions
-    ][:slots_free]   # solo abrir hasta los slots disponibles
-
-    if new_signals:
-        stats["total_signals"] += len(new_signals)
-        notify_signals_found(new_signals)
-
-        for r in new_signals:
-            _open_position(r)
-    else:
-        print(f"[{now}] 😴 Sin señales nuevas ejecutables.")
-
-
-def _open_position(r: dict):
-    """Abre una posición para un resultado del scanner."""
-    sym    = r["symbol"]
-    side   = "BUY" if r["signal"] == "LONG" else "SELL"
-    entry  = r["price"]
-    sl     = r["sl"]
-    tp     = r["tp"]
-    qty    = round(config.TRADE_MARGIN / entry, 4)
-    direction = r["signal"]
-
-    emoji = "🟢" if direction == "LONG" else "🔴"
-    print(f"  {emoji} {direction} {sym}  Entry={entry}  SL={sl}  TP={tp}  Qty={qty}")
-
-    if direction == "LONG":
-        notify_signal_long(sym, entry, sl, tp, qty, adx=r["adx"], cvd=r["cvd"])
-    else:
-        notify_signal_short(sym, entry, sl, tp, qty, adx=r["adx"], cvd=r["cvd"])
-
-    if not config.DRY_RUN:
+    # ─── Hourly ───────────────────────────────────────────
+    def hourly_task(self):
+        logger.info("Revisión horaria iniciada...")
         try:
-            resp = place_order(sym, side, "MARKET", qty, stop_loss=sl, take_profit=tp)
-            order_id = resp.get("data", {}).get("order", {}).get("orderId", "N/A")
-            notify_order_filled(side, sym, order_id, entry, qty)
-        except Exception as ex:
-            notify_order_error(side, sym, str(ex))
-            return
-
-    open_positions[sym] = {
-        "direction":     direction,
-        "entry_price":   entry,
-        "sl_price":      sl,
-        "tp_price":      tp,
-        "qty":           qty,
-        "bars_in_trade": 0,
-    }
-
-
-# ─────────────────────────────────────────────────────────────
-#  MODO SINGLE — un solo par
-# ─────────────────────────────────────────────────────────────
-
-def cycle_single():
-    """Ciclo clásico de un único par (BOT_MODE=SINGLE)."""
-    global open_positions
-    sym = config.SYMBOL
-    now = datetime.now().strftime("%H:%M:%S")
-    stats["total_scans"] += 1
-    stats["heartbeat_ctr"] += 1
-    print(f"[{now}] 🔍 Escaneando {sym}...")
-
-    try:
-        raw = get_klines(sym, config.TIMEFRAME, limit=150)
-        df  = pd.DataFrame(raw)
-        df  = df.rename(columns={"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
-        df  = df[["open", "high", "low", "close", "volume"]].astype(float)
-        df  = apply_quantum_edge(df, pivot_len=config.PIVOT_LEN)
-        current = df.iloc[-1]
-        prev    = df.iloc[-2]
-
-        cruz_alcista = (current["ema7"] > current["ema17"]) and (prev["ema7"] <= prev["ema17"])
-        cruz_bajista = (current["ema7"] < current["ema17"]) and (prev["ema7"] >= prev["ema17"])
-
-        pos = open_positions.get(sym)
-
-        # ── Gestionar posición abierta ───────────────────────
-        if pos:
-            pos["bars_in_trade"] += 1
-            if pos["bars_in_trade"] >= config.TIME_STOP:
-                notify_close_timestop(sym, pos["direction"], pos["bars_in_trade"])
-                if not config.DRY_RUN:
-                    close_side = "SELL" if pos["direction"] == "LONG" else "BUY"
-                    try:
-                        close_position(sym, close_side, pos["qty"])
-                    except Exception as ex:
-                        notify_error(f"Error cerrando {sym}: {ex}")
-                del open_positions[sym]
-            return
-
-        entry  = round(float(current["close"]), 4)
-        adx    = float(current["adx"])
-        cvd    = float(current["cvd"])
-
-        # ── Condiciones LONG ─────────────────────────────────
-        if (cruz_alcista and float(current["low"]) < float(current["valley"])
-                and bool(current["is_inst_vol"]) and adx > config.ADX_MIN
-                and cvd > 0 and entry < float(current["vwap"])):
-            sl  = round(float(current["valley"]) - float(current["atr"]) * 0.8, 2)
-            tp  = round(float(current["vwap"]), 2)
-            qty = round(config.TRADE_MARGIN / entry, 4)
-            stats["total_signals"] += 1
-            notify_signal_long(sym, entry, sl, tp, qty, adx, cvd)
-            if not config.DRY_RUN:
-                try:
-                    resp = place_order(sym, "BUY", "MARKET", qty, stop_loss=sl, take_profit=tp)
-                    oid = resp.get("data", {}).get("order", {}).get("orderId", "N/A")
-                    notify_order_filled("BUY", sym, oid, entry, qty)
-                except Exception as ex:
-                    notify_order_error("BUY", sym, str(ex))
-                    return
-            open_positions[sym] = {"direction": "LONG", "entry_price": entry,
-                                   "sl_price": sl, "tp_price": tp,
-                                   "qty": qty, "bars_in_trade": 0}
-
-        # ── Condiciones SHORT ────────────────────────────────
-        elif (cruz_bajista and float(current["high"]) > float(current["peak"])
-              and bool(current["is_inst_vol"]) and adx > config.ADX_MIN
-              and cvd < 0 and entry > float(current["vwap"])):
-            sl  = round(float(current["peak"]) + float(current["atr"]) * 0.8, 2)
-            tp  = round(float(current["vwap"]), 2)
-            qty = round(config.TRADE_MARGIN / entry, 4)
-            stats["total_signals"] += 1
-            notify_signal_short(sym, entry, sl, tp, qty, adx, cvd)
-            if not config.DRY_RUN:
-                try:
-                    resp = place_order(sym, "SELL", "MARKET", qty, stop_loss=sl, take_profit=tp)
-                    oid = resp.get("data", {}).get("order", {}).get("orderId", "N/A")
-                    notify_order_filled("SELL", sym, oid, entry, qty)
-                except Exception as ex:
-                    notify_order_error("SELL", sym, str(ex))
-                    return
-            open_positions[sym] = {"direction": "SHORT", "entry_price": entry,
-                                   "sl_price": sl, "tp_price": tp,
-                                   "qty": qty, "bars_in_trade": 0}
-        else:
-            print(f"[{now}] 😴 Sin señal — ADX={round(adx,1)}  CVD={round(cvd,2)}")
-
-    except Exception as e:
-        print(f"[{now}] ❌ Error: {e}")
-        notify_error(str(e))
-
-
-# ─────────────────────────────────────────────────────────────
-#  HEARTBEAT
-# ─────────────────────────────────────────────────────────────
-
-def heartbeat_check():
-    threshold = 5 if config.BOT_MODE == "MULTI" else 20
-    if stats["heartbeat_ctr"] >= threshold:
-        notify_heartbeat(stats["total_scans"], stats["total_signals"], len(open_positions))
-        stats["heartbeat_ctr"] = 0
-
-
-# ─────────────────────────────────────────────────────────────
-#  ARRANQUE
-# ─────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    print("=" * 55)
-    print("  🤖  Sniper Bot V36 — Quantum Edge (BingX Edition)")
-    print("=" * 55)
-    print(f"  Modo:    {'🌐 MULTI-MONEDA' if config.BOT_MODE == 'MULTI' else f'🎯 SINGLE ({config.SYMBOL})'}")
-    print(f"  DRY RUN: {'🟡 SÍ (simulación)' if config.DRY_RUN else '🔴 NO (dinero real)'}")
-    print(f"  TF:      {config.TIMEFRAME}   Margen: {config.TRADE_MARGIN} USDT   Lev: ×{config.LEVERAGE}")
-    if config.BOT_MODE == "MULTI":
-        print(f"  Vol min: ${config.MIN_VOLUME_24H:,.0f}   Top N: {config.TOP_N_RESULTS}   Max pos: {config.MAX_OPEN_TRADES}")
-    print("=" * 55)
-
-    if not config.DRY_RUN:
-        try:
-            sym_for_lev = config.SYMBOL if config.BOT_MODE == "SINGLE" else "BTC-USDT"
-            set_leverage(sym_for_lev, config.LEVERAGE)
-            print(f"  ✅ Apalancamiento ×{config.LEVERAGE} configurado")
+            self.reviewer.run(self._active)
         except Exception as e:
-            print(f"  ⚠️  No se pudo configurar apalancamiento: {e}")
+            logger.error(f"Error revisión horaria: {e}", exc_info=True)
+        self._top_symbols = self.scanner.get_top_symbols(TOP_N_SYMBOLS)
+        logger.info(f"Re-escaneado. Top {len(self._top_symbols)} pares.")
 
-    notify_startup()
+    def daily_report(self):
+        stats = self.learning.get_stats(today_only=True)
+        self.telegram.notify_daily_report(stats)
 
-    cycle = cycle_multi if config.BOT_MODE == "MULTI" else cycle_single
+    # ─── Tick principal ───────────────────────────────────
+    def tick(self):
+        self._tick_count += 1
+        symbols  = [s["symbol"] for s in self._top_symbols]
+        balance  = self.client.get_balance()
+        reasons  = Counter()   # conteo de razones de rechazo
+        checked  = 0
+        best_sym = None        # símbolo más cercano a señal
+        best_diag = {}
 
-    # Ejecución inmediata
-    cycle()
-    heartbeat_check()
+        for symbol in symbols:
+            try:
+                df = self.client.get_klines(symbol, CANDLE_INTERVAL, limit=150)
+                if df.empty or len(df) < 62:
+                    reasons["pocas_velas"] += 1
+                    continue
 
-    # Scheduler cada 3 minutos
-    schedule.every(3).minutes.at(":00").do(cycle)
-    schedule.every(3).minutes.at(":00").do(heartbeat_check)
+                checked += 1
 
-    try:
+                if symbol in self._active:
+                    self._manage_open(symbol, df)
+                    continue
+
+                # ── Diagnóstico + señal ──────────────────
+                signal = self.strategy.get_signal(
+                    df, adx_override=self.learning.params["adx_min"]
+                )
+                reason = signal.get("reason", "?")
+
+                if signal["signal"] == "NONE":
+                    reasons[reason.split("_")[0]] += 1  # agrupar por prefijo
+                    # Guardar el más prometedor (adx alto + vol_ratio alto)
+                    diag = self.strategy.get_diagnostics(df)
+                    score = diag.get("adx", 0) + diag.get("vol_ratio", 0) * 10
+                    if not best_sym or score > best_diag.get("_score", 0):
+                        diag["_score"] = score
+                        diag["_sym"]   = symbol
+                        best_diag      = diag
+                    continue
+
+                # ── Señal detectada ──────────────────────
+                logger.info(
+                    f"[{symbol}] 🎯 SEÑAL {signal['signal']} | "
+                    f"ADX={signal['adx']} vol={signal['vol_ratio']}x "
+                    f"entry={signal['entry']} sl={signal['sl']} tp={signal['tp']}"
+                )
+
+                ok, lreason = self.learning.should_take(signal)
+                if not ok:
+                    logger.info(f"[{symbol}] Aprendizaje descarta: {lreason}")
+                    reasons["aprendizaje"] += 1
+                    continue
+
+                result = self._open_trade(symbol, signal, balance)
+                if result == "OPENED":
+                    balance = self.client.get_balance()  # actualizar tras abrir
+
+                time.sleep(0.3)
+
+            except Exception as e:
+                logger.error(f"[{symbol}] tick error: {e}", exc_info=False)
+
+        # ─── Resumen del tick ────────────────────────────
+        open_n = len(self._active)
+        top_reasons = ", ".join(f"{k}={v}" for k, v in reasons.most_common(4))
+        logger.info(
+            f"TICK#{self._tick_count} | checked={checked} open={open_n}/{MAX_OPEN_TRADES} "
+            f"bal=${balance:.2f} | rechazos: {top_reasons or 'ninguno'}"
+        )
+
+        # ─── Diagnóstico detallado cada 5 ticks ─────────
+        if self._tick_count % 5 == 0 and best_diag:
+            sym = best_diag.get("_sym", "?")
+            logger.info(
+                f"MEJOR_CANDIDATO {sym} | "
+                f"ADX={best_diag.get('adx')} vol={best_diag.get('vol_ratio')}x "
+                f"gap_ema={best_diag.get('gap_ema_pct')}% "
+                f"vol_ok={best_diag.get('vol_ok')} adx_ok={best_diag.get('adx_ok')} "
+                f"cross_up={best_diag.get('cross_up')} cross_dn={best_diag.get('cross_down')}"
+            )
+
+    # ─── Abrir trade ──────────────────────────────────────
+    def _open_trade(self, symbol: str, signal: dict, balance: float) -> str:
+        ok, reason = self.risk.can_open(symbol)
+        if not ok:
+            logger.info(f"[{symbol}] Risk block: {reason}")
+            return "BLOCKED"
+
+        qty = self.risk.calc_quantity(balance, signal["entry"], signal["sl"])
+        if qty <= 0:
+            logger.warning(f"[{symbol}] qty=0 — balance insuficiente")
+            return "REJECTED"
+
+        qty, ok, reason_qty = self.client.validate_qty(qty, signal["entry"])
+        if not ok:
+            logger.warning(f"[{symbol}] {reason_qty}")
+            return "REJECTED"
+
+        position_side = "LONG" if signal["signal"] == "LONG" else "SHORT"
+        order_side    = "BUY"  if signal["signal"] == "LONG" else "SELL"
+
+        result = self.client.place_order(
+            symbol=symbol, side=order_side,
+            position_side=position_side,
+            quantity=qty, leverage=LEVERAGE,
+        )
+
+        if result.get("code") != 0:
+            logger.error(f"[{symbol}] BingX rechazó la orden: {result}")
+            return "REJECTED"
+
+        # SL y TP
+        close_side = "SELL" if signal["signal"] == "LONG" else "BUY"
+        self.client.place_stop_order(
+            symbol, close_side, position_side,
+            stop_price=signal["sl"], quantity=qty, order_type="STOP_MARKET",
+        )
+        self.client.place_stop_order(
+            symbol, close_side, position_side,
+            stop_price=signal["tp"], quantity=qty, order_type="TAKE_PROFIT_MARKET",
+        )
+
+        meta = {
+            "signal":        signal,
+            "qty":           qty,
+            "position_side": position_side,
+            "open_time":     datetime.now(timezone.utc),
+            "candle_count":  0,
+            "position_usdt": qty * signal["entry"],
+            "leverage":      LEVERAGE,
+        }
+        self._active[symbol] = meta
+        self.risk.register(symbol, meta)
+        self.telegram.notify_trade_open(symbol, signal, meta)
+        logger.info(f"[{symbol}] ✅ TRADE ABIERTO {signal['signal']} qty={qty:.4f} entry={signal['entry']}")
+        return "OPENED"
+
+    # ─── Gestionar trade abierto ──────────────────────────
+    def _manage_open(self, symbol: str, df):
+        trade = self._active.get(symbol)
+        if not trade:
+            return
+
+        trade["candle_count"] += 1
+        current_price = float(df["close"].iloc[-1])
+        signal        = trade["signal"]
+
+        positions  = self.client.get_open_positions()
+        still_open = any(
+            p.get("symbol") == symbol and float(p.get("positionAmt", 0)) != 0
+            for p in positions
+        )
+
+        if not still_open:
+            self._close_trade(symbol, trade, current_price, "TP/SL")
+            return
+
+        if trade["candle_count"] >= TIME_STOP_CANDLES:
+            logger.info(f"[{symbol}] ⏱️ TIME-STOP vela={trade['candle_count']}")
+            self.client.cancel_all_orders(symbol)
+            self.client.close_position(symbol, trade["position_side"], trade["qty"])
+            self._close_trade(symbol, trade, current_price, "TIME_STOP")
+
+    def _close_trade(self, symbol: str, trade: dict, price: float, reason: str):
+        sig   = trade["signal"]
+        pct   = (price - sig["entry"]) / sig["entry"]
+        if sig["signal"] == "SHORT":
+            pct = -pct
+        pnl   = round(pct * trade["position_usdt"] * trade["leverage"], 4)
+        dur   = (datetime.now(timezone.utc) - trade["open_time"]).total_seconds() / 60
+        outcome = {"pnl": pnl, "reason": reason, "duration_min": dur}
+        self.learning.record(symbol, sig, outcome)
+        self.telegram.notify_trade_close(symbol, outcome)
+        del self._active[symbol]
+        self.risk.close(symbol)
+        logger.info(f"[{symbol}] 🔒 CERRADO {reason} pnl={pnl:+.4f} dur={dur:.0f}min")
+
+    # ─── Run ──────────────────────────────────────────────
+    def run(self):
+        self.startup()
+        schedule.every(3).minutes.do(self.tick)
+        schedule.every(1).hour.do(self.hourly_task)
+        schedule.every().day.at("00:01").do(self.daily_report)
+        logger.info("Scheduler activo | 3min tick | 1h review | 00:01 UTC report")
+        self.tick()   # primera ejecución inmediata
         while True:
             schedule.run_pending()
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("\n🛑 Bot detenido manualmente.")
-        notify_shutdown("Interrupción manual")
-    except Exception as fatal:
-        print(f"\n💀 Error fatal: {fatal}")
-        notify_shutdown(f"Error fatal: {fatal}")
-        raise
+            time.sleep(10)
+
+
+if __name__ == "__main__":
+    bot = SniperBotV35()
+    bot.run()

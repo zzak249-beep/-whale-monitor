@@ -1,37 +1,51 @@
+"""
+config.py — Sniper Bot V35: Golden Equilibrium
+FIX: VOL_MULT default 0.9 (antes 1.5 — demasiado restrictivo)
+FIX: ADX_MIN default 15 (antes 20)
+"""
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ─── BingX API ───────────────────────────────────────────────
+# ─── BingX ────────────────────────────────────────────────
 BINGX_API_KEY    = os.getenv("BINGX_API_KEY", "")
 BINGX_SECRET_KEY = os.getenv("BINGX_SECRET_KEY", "")
-BASE_URL         = "https://open-api.bingx.com"
+BINGX_BASE_URL   = "https://open-api.bingx.com"
+BINGX_MODE       = os.getenv("BINGX_MODE", "oneway")  # "oneway" o "hedge"
 
-# ─── Telegram ────────────────────────────────────────────────
+# ─── Telegram ─────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# ─── Modo de operación ───────────────────────────────────────
-# MULTI  = escanear todas las monedas BingX y elegir la mejor
-# SINGLE = operar solo el par definido en SYMBOL
-BOT_MODE     = os.getenv("BOT_MODE", "MULTI").upper()
-SYMBOL       = os.getenv("SYMBOL",    "BTC-USDT")   # usado solo en modo SINGLE
+# ─── Estrategia V35 ───────────────────────────────────────
+EMA_FAST          = 7
+EMA_MID           = 17
+EMA_SLOW          = 21
+PIVOT_LEN         = 5
+# VOL_MULT: 0.9 permite más señales (1.5 era demasiado restrictivo para 3m)
+VOL_MULT          = float(os.getenv("VOL_MULT",  "0.9"))
+# ADX_MIN: 15 captura tendencias moderadas (20 eliminaba la mayoría del tiempo)
+ADX_MIN           = float(os.getenv("ADX_MIN",   "15"))
+ATR_SL_MULT       = float(os.getenv("ATR_SL_MULT","0.5"))
+CANDLE_INTERVAL   = os.getenv("CANDLE_INTERVAL", "3m")
+TIME_STOP_CANDLES = 15          # 15 × 3min = 45 min
 
-# ─── Trading Config ──────────────────────────────────────────
-TIMEFRAME    = os.getenv("TIMEFRAME", "3m")
-LEVERAGE     = int(os.getenv("LEVERAGE",     10))
-TRADE_MARGIN = float(os.getenv("TRADE_MARGIN", 25.0))   # USDT por trade
-DRY_RUN      = os.getenv("DRY_RUN", "true").lower() == "true"
+# ─── Riesgo ───────────────────────────────────────────────
+CAPITAL_PCT     = float(os.getenv("CAPITAL_PCT",    "2"))
+MAX_OPEN_TRADES = int(os.getenv("MAX_TRADES",       "3"))
+LEVERAGE        = int(os.getenv("LEVERAGE",         "5"))
+MIN_ORDER_USDT  = float(os.getenv("MIN_ORDER_USDT", "6.0"))
 
-# ─── Scanner Multi-Moneda ────────────────────────────────────
-MIN_VOLUME_24H  = float(os.getenv("MIN_VOLUME_24H", 5_000_000))  # USDT/24h mínimo
-TOP_N_RESULTS   = int(os.getenv("TOP_N_RESULTS", 10))             # top resultados en Telegram
-MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", 3))            # máx posiciones simultáneas
-SCAN_DELAY_MS   = int(os.getenv("SCAN_DELAY_MS", 120))            # ms entre requests al escanear
+# ─── Scanner ──────────────────────────────────────────────
+TOP_N_SYMBOLS         = 20
+SCAN_INTERVAL_MINUTES = 60
 
-# ─── Parámetros V36 Quantum Edge ─────────────────────────────
-PIVOT_LEN    = 5
-ADX_MIN      = 20
-VOL_MULT     = 1.5
-TIME_STOP    = 15   # velas máximas en posición (15 × 3m = 45 min)
+# ─── Aprendizaje ──────────────────────────────────────────
+DATA_DIR            = "data"
+LEARNING_FILE       = "data/trades.json"
+MIN_TRADES_TO_LEARN = 10
+SYMBOL_BLACKLIST_WR = 30
+
+# ─── Modo ─────────────────────────────────────────────────
+DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
