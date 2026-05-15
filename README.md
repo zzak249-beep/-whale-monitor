@@ -1,103 +1,159 @@
-# 🤖 Sniper Bot V36 — Quantum Edge (BingX + Telegram + Railway)
+# 🎯 Sniper Bot V49 — Híbrido [Markov + Kotegawa]
 
-Bot de trading automático 24/7 para futuros en BingX con notificaciones completas vía Telegram.
-
----
-
-## 📁 Estructura del Proyecto
-
-```
-sniper-bot-v36/
-├── main.py               ← Cerebro del bot (arrancar esto)
-├── config.py             ← Configuración centralizada
-├── indicators.py         ← Motor Quantum Edge V36
-├── bingx.py              ← API BingX (órdenes, datos, firmas)
-├── telegram_notifier.py  ← Todas las notificaciones Telegram
-├── requirements.txt      ← Dependencias Python
-├── Procfile              ← Comando de arranque para Railway
-├── .env.example          ← Plantilla de variables (COPIAR a .env)
-└── .gitignore            ← Excluye .env del repositorio
-```
+Bot algorítmico de trading para **Binance Futures (USDT-M)** con notificaciones en **Telegram**, desplegable en **Railway** en minutos.
 
 ---
 
-## 🚀 Despliegue en Railway (paso a paso)
+## 🧠 Ventaja competitiva
 
-### 1. Crear tu Bot de Telegram
-1. Abre Telegram y busca `@BotFather`
-2. Envía `/newbot` y sigue los pasos → obtendrás el **TELEGRAM_TOKEN**
-3. Busca `@userinfobot` → te enviará tu **TELEGRAM_CHAT_ID**
-
-### 2. Subir a GitHub
-```bash
-git init
-git add .
-git commit -m "Sniper Bot V36 inicial"
-git remote add origin https://github.com/TU_USUARIO/sniper-bot-v36.git
-git push -u origin main
-```
-> ⚠️ Nunca subas el archivo `.env` — está en `.gitignore`
-
-### 3. Conectar Railway
-1. Ve a [railway.app](https://railway.app) → **New Project → Deploy from GitHub repo**
-2. Selecciona tu repositorio
-3. En la pestaña **Variables**, añade todas estas:
-
-| Variable | Valor |
-|---|---|
-| `BINGX_API_KEY` | Tu API Key de BingX |
-| `BINGX_SECRET_KEY` | Tu Secret Key de BingX |
-| `TELEGRAM_TOKEN` | Token del bot de Telegram |
-| `TELEGRAM_CHAT_ID` | Tu Chat ID de Telegram |
-| `SYMBOL` | `BTC-USDT` |
-| `TIMEFRAME` | `3m` |
-| `LEVERAGE` | `10` |
-| `TRADE_MARGIN` | `25` |
-| `DRY_RUN` | `true` (simulación) o `false` (real) |
-
-4. Railway detecta el `Procfile` y arranca automáticamente.
-
----
-
-## 📲 Notificaciones Telegram que recibirás
-
-| Evento | Cuándo |
-|---|---|
-| 🤖 **Bot iniciado** | Al arrancar Railway |
-| 🟢 **Señal LONG** | Cuando se detecta entrada alcista |
-| 🔴 **Señal SHORT** | Cuando se detecta entrada bajista |
-| ✅ **Orden ejecutada** | Confirmación de BingX (modo real) |
-| ⚠️ **Error de orden** | Si BingX rechaza la orden |
-| ⏳ **Time Stop** | Al cerrar por límite de velas |
-| 💓 **Heartbeat** | Cada ~1 hora (bot vivo) |
-| ❌ **Error del loop** | Cualquier excepción inesperada |
-| 🛑 **Bot detenido** | Si Railway reinicia o hay fallo fatal |
-
----
-
-## ⚙️ Parámetros Ajustables (en config.py)
-
-| Parámetro | Default | Descripción |
+| Capa | Tecnología | Ventaja |
 |---|---|---|
-| `PIVOT_LEN` | 5 | Longitud del ZigZag para niveles |
-| `ADX_MIN` | 20 | Fuerza mínima de tendencia |
-| `VOL_MULT` | 1.5 | Multiplicador de volumen institucional |
-| `TIME_STOP` | 15 | Velas máximas por posición (45 min) |
+| **Motor Markov** | Matriz de transición 3×3 sliding | Probabilidad estadística de continuación de estado |
+| **ADX Adaptativo** | Régimen detection V50.1 | Parámetros dinámicos según volatilidad |
+| **Filtros institucionales** | VWAP + RVOL + POC | Detecta flujo de dinero inteligente |
+| **Kotegawa Dip** | MA25 + RSI + BB | Confluencia de reversión a la media |
+| **STC Oscillator** | Schaff Trend Cycle | Evita entradas en sobrecompra/sobreventa extrema |
+| **Kelly Fraccional** | 1/4 Kelly criterion | Sizing matemáticamente óptimo |
+| **Triple Barrera** | TP + SL + Tiempo | Exit multi-dimensión estilo ML |
+
+La señal requiere **≥55 puntos** de un scoring compuesto de 100. Dos capas independientes deben converger para activar una entrada.
 
 ---
 
-## 🔒 Modo Seguro
+## 🗂 Estructura del proyecto
 
-Por defecto `DRY_RUN=true` → El bot **analiza y notifica** pero **NO coloca órdenes reales**.
-
-Para operar con dinero real, cambia en Railway:
 ```
-DRY_RUN=false
+sniper-bot/
+├── main.py                  # Bucle principal async
+├── config.py                # Variables de entorno
+├── requirements.txt
+├── Procfile                 # Railway worker
+├── railway.json
+├── .env.example
+└── bot/
+    ├── indicators.py        # EMA, ATR, ADX, VWAP, RVOL, POC, STC, RSI, BB, Pivots
+    ├── markov.py            # Motor Markov con ventana deslizante
+    ├── strategy.py          # Fusión Sniper V49 + Kotegawa
+    ├── risk_manager.py      # Kelly + Triple Barrera + DD guard
+    ├── binance_client.py    # Binance Futures async (TP/SL automáticos)
+    ├── telegram_notifier.py # Mensajes ricos en Telegram
+    └── utils.py             # Logging con colores
 ```
 
 ---
 
-## ⚠️ Advertencia
+## ⚙️ Configuración paso a paso
 
-El trading de futuros con apalancamiento conlleva riesgo de pérdida total del capital.
-Prueba siempre en modo `DRY_RUN=true` antes de activar dinero real.
+### 1. Clonar el repositorio
+```bash
+git clone https://github.com/TU_USUARIO/sniper-bot.git
+cd sniper-bot
+```
+
+### 2. Credenciales Binance Futures
+1. Ve a [Binance → Gestión de API](https://www.binance.com/es/my/settings/api-management)
+2. Crea una nueva API Key con permisos:
+   - ✅ **Leer**
+   - ✅ **Trading de futuros**
+   - ❌ **NO** habilites retiradas
+3. Restringe la IP a la IP de tu servidor Railway (opcional pero recomendado)
+
+### 3. Bot de Telegram
+```bash
+# 1. Habla con @BotFather en Telegram → /newbot → guarda el TOKEN
+# 2. Habla con @userinfobot → guarda tu CHAT_ID
+# O usa: https://api.telegram.org/bot<TOKEN>/getUpdates
+```
+
+### 4. Variables de entorno (local)
+```bash
+cp .env.example .env
+# Edita .env con tus credenciales reales
+```
+
+---
+
+## 🚀 Deploy en Railway
+
+### Opción A — GitHub (recomendado)
+1. Sube el proyecto a GitHub
+2. En [railway.app](https://railway.app) → **New Project → Deploy from GitHub**
+3. Selecciona el repositorio
+4. En **Variables** agrega todas las del `.env.example`
+5. Railway detecta el `Procfile` y despliega automáticamente
+
+### Opción B — Railway CLI
+```bash
+npm install -g @railway/cli
+railway login
+railway init
+railway up
+railway variables set BINANCE_API_KEY=... TELEGRAM_TOKEN=... # etc.
+```
+
+### Variables obligatorias en Railway
+```
+BINANCE_API_KEY
+BINANCE_SECRET_KEY
+TELEGRAM_TOKEN
+TELEGRAM_CHAT_ID
+```
+
+---
+
+## 🧪 Paper Trading primero (OBLIGATORIO)
+
+```env
+TESTNET=true
+```
+
+Binance Futures Testnet: https://testnet.binancefuture.com
+
+**Valida durante al menos 2 semanas antes de usar dinero real.**
+
+---
+
+## 📊 Mensajes Telegram
+
+| Evento | Contenido |
+|---|---|
+| 🚀 Arranque | Config, modo, pares, leverage |
+| 📈📉 Entrada | Precio, qty, TP, SL, régimen, ADX, probs Markov, RVOL, STC, VWAP, POC, RSI, score total, razones |
+| ✅❌ Salida | Motivo (TP/SL/Tiempo), PnL USDT, PnL %, balance |
+| 💓 Heartbeat | Cada hora: balance, PnL diario, DD, estado por par |
+| ⚠️ Error | Stack trace truncado |
+
+---
+
+## ⚠️ Avisos de riesgo
+
+> **El trading con apalancamiento puede resultar en pérdida total del capital.**
+> Este software se proporciona sin garantías. Úsalo bajo tu propia responsabilidad.
+> Empieza siempre con capital que puedas permitirte perder.
+
+**Ajustes conservadores recomendados para empezar:**
+```env
+LEVERAGE=3
+RISK_PER_TRADE=1.0
+MAX_DAILY_LOSS_PCT=2.0
+ATR_MULT_TP=2.5
+ATR_MULT_SL=1.0
+```
+
+---
+
+## 🔧 Ajuste de parámetros
+
+| Parámetro | Valor base | Mercado alcista | Mercado lateral |
+|---|---|---|---|
+| `PROB_THRESHOLD` | 40% | 35% | 50% |
+| `RVOL_MIN` | 1.5x | 1.3x | 2.0x |
+| `ATR_MULT_TP` | 2.0 | 2.5 | 1.5 |
+| `ADX_TREND` | 25 | 20 | 30 |
+
+---
+
+## 📋 Logs
+
+Los logs se guardan en `logs/bot.log` con rotación automática.
+En Railway puedes verlos en tiempo real desde el panel → **Deployments → View Logs**.
