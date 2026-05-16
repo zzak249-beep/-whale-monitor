@@ -1,70 +1,64 @@
 """
-config.py — Carga y valida todas las variables de entorno.
+SAMA APEX Bot - Configuration
+Centraliza todos los parámetros del sistema
 """
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
+# ─── BingX API ───────────────────────────────────────────────────────────────
+BINGX_API_KEY    = os.getenv("BINGX_API_KEY", "")
+BINGX_SECRET_KEY = os.getenv("BINGX_SECRET_KEY", "")
+BINGX_BASE_URL   = "https://open-api.bingx.com"
 
-def _require(key: str) -> str:
-    val = os.getenv(key)
-    if not val:
-        raise EnvironmentError(f"Variable de entorno requerida no encontrada: {key}")
-    return val
+# ─── Telegram ─────────────────────────────────────────────────────────────────
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
+# ─── Trading Universe ─────────────────────────────────────────────────────────
+# Puedes poner varios símbolos: el bot escanea y elige el mejor setup
+SYMBOLS = os.getenv("SYMBOLS", "BTC-USDT,ETH-USDT,SOL-USDT,BNB-USDT").split(",")
 
-class Config:
-    # --- Binance ---
-    BINANCE_API_KEY: str  = _require("BINANCE_API_KEY")
-    BINANCE_SECRET_KEY: str = _require("BINANCE_SECRET_KEY")
-    TESTNET: bool         = os.getenv("TESTNET", "false").lower() == "true"
+# ─── Timeframes ───────────────────────────────────────────────────────────────
+TF_LOCAL   = os.getenv("TF_LOCAL",   "5m")    # Timeframe de entrada
+TF_MACRO_1 = os.getenv("TF_MACRO_1", "15m")   # Filtro intermedio
+TF_MACRO_2 = os.getenv("TF_MACRO_2", "1h")    # Filtro macro
 
-    # --- Telegram ---
-    TELEGRAM_TOKEN: str   = _require("TELEGRAM_TOKEN")
-    TELEGRAM_CHAT_ID: str = _require("TELEGRAM_CHAT_ID")
+# ─── SAMA Parameters (replicados exactos del Pine Script) ─────────────────────
+AMA_LENGTH     = int(os.getenv("AMA_LENGTH",     "200"))
+MAJOR_LENGTH   = int(os.getenv("MAJOR_LENGTH",   "14"))
+MINOR_LENGTH   = int(os.getenv("MINOR_LENGTH",   "6"))
+SLOPE_PERIOD   = int(os.getenv("SLOPE_PERIOD",   "34"))
+SLOPE_RANGE    = int(os.getenv("SLOPE_RANGE",    "25"))
+FLAT_THRESHOLD = int(os.getenv("FLAT_THRESHOLD", "17"))
+ATR_PERIOD     = int(os.getenv("ATR_PERIOD",     "14"))
+ATR_MULT       = float(os.getenv("ATR_MULT",     "2.0"))
+RVOL_PERIOD    = int(os.getenv("RVOL_PERIOD",    "50"))
+RVOL_MIN       = float(os.getenv("RVOL_MIN",     "1.2"))
 
-    # --- Trading ---
-    SYMBOLS: list         = [s.strip() for s in os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT").split(",")]
-    TIMEFRAME: str        = os.getenv("TIMEFRAME", "15m")
-    LEVERAGE: int         = int(os.getenv("LEVERAGE", "5"))
-    RISK_PER_TRADE: float = float(os.getenv("RISK_PER_TRADE", "1.5"))
+# ─── Risk Management ──────────────────────────────────────────────────────────
+LEVERAGE          = int(os.getenv("LEVERAGE",          "5"))
+RISK_PER_TRADE    = float(os.getenv("RISK_PER_TRADE",  "0.01"))   # 1% del balance por trade
+MAX_OPEN_TRADES   = int(os.getenv("MAX_OPEN_TRADES",   "3"))
+DAILY_LOSS_LIMIT  = float(os.getenv("DAILY_LOSS_LIMIT","0.05"))   # Circuit breaker: -5% día
+MIN_CONFLUENCE    = int(os.getenv("MIN_CONFLUENCE",    "60"))      # Score mínimo para entrar
+TRAILING_ENABLED  = os.getenv("TRAILING_ENABLED", "true").lower() == "true"
+TRAILING_ATR_MULT = float(os.getenv("TRAILING_ATR_MULT", "1.5"))
 
-    # --- Motor Markov ---
-    SLOPE_MIN: float       = float(os.getenv("SLOPE_MIN", "30.0"))
-    LOOKBACK_MARKOV: int   = int(os.getenv("LOOKBACK_MARKOV", "200"))
-    PROB_THRESHOLD: float  = float(os.getenv("PROB_THRESHOLD", "40.0"))
+# ─── Funding Rate Filter (EDGE ESPECIAL) ──────────────────────────────────────
+FUNDING_FILTER    = os.getenv("FUNDING_FILTER", "true").lower() == "true"
+FUNDING_EXTREME   = float(os.getenv("FUNDING_EXTREME", "0.0008"))  # 0.08% extremo
 
-    # --- ADX Adaptativo ---
-    ADX_LEN: int    = int(os.getenv("ADX_LEN", "14"))
-    ADX_TREND: int  = int(os.getenv("ADX_TREND", "25"))
-    ADX_RANGE: int  = int(os.getenv("ADX_RANGE", "20"))
+# ─── Session Filter (EDGE ESPECIAL) ───────────────────────────────────────────
+# Solo opera en sesiones de alta liquidez (London + NY)
+SESSION_FILTER    = os.getenv("SESSION_FILTER", "true").lower() == "true"
+# Horas UTC de sesiones activas: London 07-16, NY overlap 13-21
+SESSION_HOURS_UTC = [(7, 16), (13, 21)]
 
-    # --- Filtros institucionales ---
-    RVOL_MIN: float    = float(os.getenv("RVOL_MIN", "1.5"))
-    POC_LOOKBACK: int  = int(os.getenv("POC_LOOKBACK", "50"))
-    PIVOT_LEN: int     = int(os.getenv("PIVOT_LEN", "4"))
+# ─── Bot Timing ───────────────────────────────────────────────────────────────
+SCAN_INTERVAL     = int(os.getenv("SCAN_INTERVAL", "60"))   # segundos entre scans
+HEALTH_PORT       = int(os.getenv("PORT", "8080"))           # Railway healthcheck
 
-    # --- Triple barrera ---
-    ATR_MULT_TP: float   = float(os.getenv("ATR_MULT_TP", "2.0"))
-    ATR_MULT_SL: float   = float(os.getenv("ATR_MULT_SL", "1.2"))
-    MAX_BARS_HOLD: int   = int(os.getenv("MAX_BARS_HOLD", "20"))
-
-    # --- Kotegawa ---
-    DIP_PCT: float      = float(os.getenv("DIP_PCT", "20.0"))
-    MA_LEN: int         = int(os.getenv("MA_LEN", "25"))
-    RSI_LEN: int        = int(os.getenv("RSI_LEN", "14"))
-    RSI_OVERSOLD: float = float(os.getenv("RSI_OVERSOLD", "24.0"))
-    BB_LEN: int         = int(os.getenv("BB_LEN", "20"))
-    BB_MULT: float      = float(os.getenv("BB_MULT", "2.0"))
-
-    # --- Riesgo global ---
-    MAX_DAILY_LOSS_PCT: float  = float(os.getenv("MAX_DAILY_LOSS_PCT", "3.0"))
-    MAX_OPEN_POSITIONS: int    = int(os.getenv("MAX_OPEN_POSITIONS", "2"))
-    LOOP_INTERVAL: int         = int(os.getenv("LOOP_INTERVAL", "60"))
-
-    def __repr__(self) -> str:
-        return (
-            f"<Config symbols={self.SYMBOLS} tf={self.TIMEFRAME} "
-            f"lev={self.LEVERAGE}x testnet={self.TESTNET}>"
-        )
+# ─── Candles needed (buffer para cálculos) ────────────────────────────────────
+CANDLES_NEEDED = max(AMA_LENGTH + SLOPE_PERIOD + 10, 250)

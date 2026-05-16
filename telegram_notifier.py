@@ -1,170 +1,179 @@
-import requests
-import config
-from datetime import datetime
+"""
+SAMA APEX Bot - Telegram Notifier
+Mensajes ricos y estructurados para todas las señales y eventos
+"""
+import aiohttp
+import asyncio
+import logging
+from datetime import datetime, timezone
+from config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 
-TELEGRAM_API = f"https://api.telegram.org/bot{config.TELEGRAM_TOKEN}"
+logger = logging.getLogger(__name__)
+
+TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 
-def _send(text: str, parse_mode: str = "HTML") -> bool:
-    if not config.TELEGRAM_TOKEN or not config.TELEGRAM_CHAT_ID:
-        print("[TELEGRAM] ⚠️  Token o Chat ID no configurados.")
-        return False
+async def _send(text: str, parse_mode: str = "HTML"):
+    """Envío async de mensaje a Telegram"""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.warning("Telegram no configurado")
+        return
     try:
-        resp = requests.post(
-            f"{TELEGRAM_API}/sendMessage",
-            json={
-                "chat_id": config.TELEGRAM_CHAT_ID,
-                "text": text,
-                "parse_mode": parse_mode,
-                "disable_web_page_preview": True,
-            },
-            timeout=10,
-        )
-        return resp.status_code == 200
+        async with aiohttp.ClientSession() as s:
+            async with s.post(
+                f"{TELEGRAM_API}/sendMessage",
+                json={
+                    "chat_id":    TELEGRAM_CHAT_ID,
+                    "text":       text,
+                    "parse_mode": parse_mode,
+                },
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as r:
+                resp = await r.json()
+                if not resp.get("ok"):
+                    logger.error(f"Telegram error: {resp}")
     except Exception as e:
-        print(f"[TELEGRAM] Error: {e}")
-        return False
+        logger.error(f"Telegram send error: {e}")
 
 
-def notify_startup():
-    mode_str = "🔴 DINERO REAL" if not config.DRY_RUN else "🟡 SIMULACIÓN"
-    bot_mode = "🌐 MULTI-MONEDA" if config.BOT_MODE == "MULTI" else f"🎯 SINGLE ({config.SYMBOL})"
-    _send(
-        f"🤖 <b>Sniper Bot V36 — Quantum Edge</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"✅ Bot iniciado  {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n\n"
-        f"🗺 Modo:       <b>{bot_mode}</b>\n"
-        f"⏱ Timeframe:  <code>{config.TIMEFRAME}</code>\n"
-        f"⚡ Apalancamiento: <code>×{config.LEVERAGE}</code>\n"
-        f"💵 Margen/trade:   <code>{config.TRADE_MARGIN} USDT</code>\n"
-        f"📦 Max posiciones: <code>{config.MAX_OPEN_TRADES}</code>\n"
-        f"💧 Vol mínimo 24h: <code>${config.MIN_VOLUME_24H:,.0f}</code>\n\n"
-        f"🎮 Ejecución: <b>{mode_str}</b>"
-    )
+def _ts() -> str:
+    return datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
 
 
-def notify_shutdown(reason: str = "desconocido"):
-    _send(f"🛑 <b>Bot Detenido</b>\nRazón: {reason}\n⏰ {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
+# ─── Signal Alert ─────────────────────────────────────────────────────────────
+
+async def notify_signal(symbol: str, signal: dict, confluence: dict,
+                         entry: float, sl: float, tp: float,
+                         qty: float, balance: float):
+    dir_emoji = "🟢 LONG" if signal["direction"] == "LONG" else "🔴 SHORT"
+    score     = confluence["score"]
+    score_bar = "█" * (score // 10) + "░" * (10 - score // 10)
+
+    risk_pct  = abs(entry - sl) / entry * 100
+    rr_ratio  = abs(tp - entry) / abs(entry - sl)
+
+    text = f"""
+<b>⚡ SAMA APEX — NUEVA SEÑAL</b>
+━━━━━━━━━━━━━━━━━━━
+<b>Par:</b>      {symbol}
+<b>Dirección:</b> {dir_emoji}
+<b>Hora:</b>     {_ts()}
+
+<b>— Precios —</b>
+📍 <b>Entrada:</b>  <code>{entry:.4f}</code>
+🛑 <b>Stop Loss:</b> <code>{sl:.4f}</code>  ({risk_pct:.2f}%)
+🎯 <b>Take Profit:</b> <code>{tp:.4f}</code>
+⚖️ <b>R:R Ratio:</b>  1 : {rr_ratio:.1f}
+
+<b>— Confluence Score —</b>
+<code>[{score_bar}] {score}/100</code>
+
+<b>— Multi-TF Alignment —</b>
+🕐 Local:   {confluence.get('lt','?')}
+🕒 Macro 1: {confluence.get('m1t','?')}
+🕙 Macro 2: {confluence.get('m2t','?')}
+
+<b>— Condiciones —</b>
+📊 Slope avg:   {confluence.get('avg_slope', 0):.1f}°
+📦 RVOL avg:    {confluence.get('avg_rvol', 0):.2f}x
+💰 Funding:     {confluence.get('funding', 0)*100:.4f}%
+🏦 Sesión:      {'Activa ✅' if confluence.get('session') else 'Inactiva ⚠️'}
+
+<b>— Orden —</b>
+🔢 Qty:      <code>{qty:.4f}</code>
+💵 Balance:  <code>{balance:.2f} USDT</code>
+━━━━━━━━━━━━━━━━━━━
+<i>Señal generada por SAMA APEX Bot</i>
+""".strip()
+
+    await _send(text)
 
 
-def notify_error(error: str):
-    _send(
-        f"❌ <b>ERROR en el Bot</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<code>{error[:500]}</code>\n"
-        f"⏰ {datetime.now().strftime('%H:%M:%S')}"
-    )
+# ─── Trade Executed ───────────────────────────────────────────────────────────
+
+async def notify_trade_opened(symbol: str, direction: str,
+                               entry: float, sl: float, tp: float, qty: float):
+    emoji = "🟢" if direction == "LONG" else "🔴"
+    text = f"""
+{emoji} <b>TRADE ABIERTO</b> — {symbol}
+<b>Dir:</b> {direction}  |  <b>Entry:</b> <code>{entry:.4f}</code>
+<b>SL:</b> <code>{sl:.4f}</code>  |  <b>TP:</b> <code>{tp:.4f}</code>
+<b>Qty:</b> <code>{qty:.4f}</code>  |  <b>Hora:</b> {_ts()}
+""".strip()
+    await _send(text)
 
 
-def notify_scan_summary(total: int, longs: int, shorts: int, duration_s: float):
-    _send(
-        f"🔭 <b>Escaneo Completado</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔍 Pares analizados: <code>{total}</code>\n"
-        f"🟢 Señales LONG:  <code>{longs}</code>\n"
-        f"🔴 Señales SHORT: <code>{shorts}</code>\n"
-        f"⏱ Duración: <code>{duration_s:.0f}s</code>\n"
-        f"⏰ {datetime.now().strftime('%H:%M:%S')}"
-    )
+# ─── Trade Closed ─────────────────────────────────────────────────────────────
+
+async def notify_trade_closed(result: dict):
+    pnl = result.get("pnl_pct", 0)
+    emoji = "✅ WIN" if pnl >= 0 else "❌ LOSS"
+    text = f"""
+{emoji} — <b>{result['symbol']}</b>
+<b>Dir:</b> {result['direction']}
+<b>Entry:</b> <code>{result['entry']:.4f}</code> → <b>Exit:</b> <code>{result['exit']:.4f}</code>
+<b>PnL:</b> <code>{pnl*100:+.2f}%</code>  |  <b>Hora:</b> {_ts()}
+""".strip()
+    await _send(text)
 
 
-def notify_top_opportunities(results: list, top_n: int = 10):
-    if not results:
-        _send("📊 <b>Top Oportunidades</b>\n\nSin resultados destacados en este ciclo.")
-        return
+# ─── Trailing Stop Update ─────────────────────────────────────────────────────
 
-    lines = [
-        f"📊 <b>Top {min(top_n, len(results))} Oportunidades — {config.TIMEFRAME}</b>",
-        f"━━━━━━━━━━━━━━━━━━━━━━",
-    ]
-    for i, r in enumerate(results[:top_n], 1):
-        sig_emoji = "🟢" if r["signal"] == "LONG" else ("🔴" if r["signal"] == "SHORT" else "⬜")
-        rr_str = f"R/R {r['rr']}" if r["rr"] else "—"
-        lines.append(
-            f"{i}. {sig_emoji} <b>{r['symbol']}</b>  Score: <code>{r['score']}%</code>\n"
-            f"   💰 {r['price']}  ADX: {r['adx']}  CVD: {r['cvd']}  {rr_str}"
-        )
-    lines.append(f"\n⏰ {datetime.now().strftime('%H:%M:%S')}")
-    _send("\n".join(lines))
+async def notify_trailing_update(symbol: str, old_sl: float, new_sl: float):
+    text = f"""
+🔄 <b>TRAILING STOP</b> — {symbol}
+SL movido: <code>{old_sl:.4f}</code> → <code>{new_sl:.4f}</code>
+{_ts()}
+""".strip()
+    await _send(text)
 
 
-def notify_signals_found(signals: list):
-    if not signals:
-        return
-    MAX_PER_MSG = 5
-    for i in range(0, len(signals), MAX_PER_MSG):
-        batch = signals[i:i + MAX_PER_MSG]
-        lines = [f"🚨 <b>Señales Detectadas ({len(signals)} total)</b>", "━━━━━━━━━━━━━━━━━━━━━━"]
-        for r in batch:
-            emoji = "🟢 LONG" if r["signal"] == "LONG" else "🔴 SHORT"
-            mode_tag = "📋 SIM" if config.DRY_RUN else "✅ REAL"
-            rr_str = f"R/R <code>1:{r['rr']}</code>" if r["rr"] else ""
-            lines.append(
-                f"\n{emoji}  <b>{r['symbol']}</b>  {mode_tag}\n"
-                f"  Entry: <code>{r['price']}</code>  SL: <code>{r['sl']}</code>  TP: <code>{r['tp']}</code>\n"
-                f"  ADX: <code>{r['adx']}</code>  CVD: <code>{r['cvd']}</code>  Score: <code>{r['score']}%</code>  {rr_str}"
-            )
-        lines.append(f"\n⏰ {datetime.now().strftime('%H:%M:%S')}")
-        _send("\n".join(lines))
+# ─── Circuit Breaker ──────────────────────────────────────────────────────────
+
+async def notify_circuit_breaker(daily_pnl: float, balance: float):
+    text = f"""
+🚨 <b>CIRCUIT BREAKER ACTIVADO</b>
+PnL del día: <code>{daily_pnl*100:+.2f}%</code>
+Balance: <code>{balance:.2f} USDT</code>
+Bot en pausa hasta mañana (UTC).
+{_ts()}
+""".strip()
+    await _send(text)
 
 
-def notify_signal_long(symbol, entry, sl, tp, qty, adx, cvd):
-    mode_tag = "📋 SIMULADA" if config.DRY_RUN else "✅ EJECUTADA"
-    rr = round(abs(tp - entry) / abs(entry - sl), 2) if abs(entry - sl) > 0 else "N/A"
-    _send(
-        f"🟢 <b>SEÑAL LONG — {symbol}</b>  {mode_tag}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📈 Entry: <code>{entry}</code>  SL: <code>{sl}</code>  TP: <code>{tp}</code>\n"
-        f"📦 Qty: <code>{qty}</code>  ADX: <code>{round(adx,1)}</code>  CVD: <code>{round(cvd,2)}</code>  R/R: <code>1:{rr}</code>\n"
-        f"⏰ {datetime.now().strftime('%H:%M:%S')}"
-    )
+# ─── Daily Summary ────────────────────────────────────────────────────────────
+
+async def notify_daily_summary(stats: dict, balance: float):
+    wr = stats.get("win_rate", 0)
+    text = f"""
+📊 <b>RESUMEN DIARIO — SAMA APEX</b>
+━━━━━━━━━━━━━━━━━━━
+💰 <b>Balance:</b>   <code>{balance:.2f} USDT</code>
+📈 <b>PnL día:</b>  <code>{stats['daily_pnl']*100:+.2f}%</code>
+🏆 <b>Trades:</b>   {stats['trades']} ({stats['wins']}W / {stats['losses']}L)
+🎯 <b>Win Rate:</b> {wr*100:.1f}%
+━━━━━━━━━━━━━━━━━━━
+{_ts()}
+""".strip()
+    await _send(text)
 
 
-def notify_signal_short(symbol, entry, sl, tp, qty, adx, cvd):
-    mode_tag = "📋 SIMULADA" if config.DRY_RUN else "✅ EJECUTADA"
-    rr = round(abs(tp - entry) / abs(sl - entry), 2) if abs(sl - entry) > 0 else "N/A"
-    _send(
-        f"🔴 <b>SEÑAL SHORT — {symbol}</b>  {mode_tag}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📉 Entry: <code>{entry}</code>  SL: <code>{sl}</code>  TP: <code>{tp}</code>\n"
-        f"📦 Qty: <code>{qty}</code>  ADX: <code>{round(adx,1)}</code>  CVD: <code>{round(cvd,2)}</code>  R/R: <code>1:{rr}</code>\n"
-        f"⏰ {datetime.now().strftime('%H:%M:%S')}"
-    )
+# ─── Error Alert ──────────────────────────────────────────────────────────────
+
+async def notify_error(msg: str):
+    await _send(f"⚠️ <b>ERROR BOT</b>\n<code>{msg[:300]}</code>\n{_ts()}")
 
 
-def notify_order_filled(side: str, symbol: str, order_id: str, fill_price: float, qty: float):
-    emoji = "🟢" if side == "BUY" else "🔴"
-    direction = "LONG" if side == "BUY" else "SHORT"
-    _send(
-        f"{emoji} <b>ORDEN EJECUTADA — {direction} {symbol}</b>\n"
-        f"🆔 <code>{order_id}</code>  💰 <code>{fill_price}</code>  Qty: <code>{qty}</code>\n"
-        f"⏰ {datetime.now().strftime('%H:%M:%S')}"
-    )
+# ─── Startup ──────────────────────────────────────────────────────────────────
 
-
-def notify_order_error(side: str, symbol: str, error: str):
-    _send(f"⚠️ <b>ERROR ORDEN {side} — {symbol}</b>\n<code>{error[:400]}</code>\n⏰ {datetime.now().strftime('%H:%M:%S')}")
-
-
-def notify_close_timestop(symbol: str, direction: str, bars: int):
-    _send(f"⏳ <b>TIME STOP — {symbol}</b>\nDirección: <b>{direction}</b>  |  {bars} velas ({bars * 3} min)\n⏰ {datetime.now().strftime('%H:%M:%S')}")
-
-
-def notify_close_tp(symbol: str, direction: str, entry: float, tp: float):
-    pnl = round(abs(tp - entry) / entry * 100 * config.LEVERAGE, 2)
-    _send(f"🎯 <b>TAKE PROFIT ✅ — {symbol}</b>\nDirección: <b>{direction}</b>  Entry: <code>{entry}</code> → TP: <code>{tp}</code>\n💸 PnL est.: <b>+{pnl}%</b>\n⏰ {datetime.now().strftime('%H:%M:%S')}")
-
-
-def notify_close_sl(symbol: str, direction: str, entry: float, sl: float):
-    pnl = round(abs(sl - entry) / entry * 100 * config.LEVERAGE, 2)
-    _send(f"🛑 <b>STOP LOSS — {symbol}</b>\nDirección: <b>{direction}</b>  Entry: <code>{entry}</code> → SL: <code>{sl}</code>\n💸 PnL est.: <b>-{pnl}%</b>\n⏰ {datetime.now().strftime('%H:%M:%S')}")
-
-
-def notify_heartbeat(scans: int, signals: int, open_trades: int):
-    _send(
-        f"💓 <b>Heartbeat — Bot Activo</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔍 Ciclos: <code>{scans}</code>  📡 Señales: <code>{signals}</code>\n"
-        f"📂 Posiciones: <code>{open_trades}/{config.MAX_OPEN_TRADES}</code>\n"
-        f"⏰ {datetime.now().strftime('%d/%m %H:%M:%S')}"
-    )
+async def notify_startup(symbols: list, tfs: tuple):
+    text = f"""
+🚀 <b>SAMA APEX BOT INICIADO</b>
+━━━━━━━━━━━━━━━━━━━
+📊 <b>Pares:</b> {', '.join(symbols)}
+⏱ <b>TFs:</b>   {tfs[0]} / {tfs[1]} / {tfs[2]}
+🕐 <b>Hora:</b>  {_ts()}
+━━━━━━━━━━━━━━━━━━━
+<i>Monitoring activo. Esperando señales...</i>
+""".strip()
+    await _send(text)
