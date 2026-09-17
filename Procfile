@@ -1,1 +1,1 @@
-web: python bot.py
+worker: python crowding_bot.py
