@@ -1,5 +1,7 @@
 __pycache__/
 *.py[cod]
 .env
-*.log
-data/
+*.csv
+*.json
+!railway.toml
+.venv/
